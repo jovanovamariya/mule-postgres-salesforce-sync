@@ -1,0 +1,8 @@
+db.host=localhost
+db.port=5432
+db.name=muledb
+db.user=mule
+db.password=changeme
+sf.username=user@example.com
+sf.password=changeme
+sf.token=changeme
