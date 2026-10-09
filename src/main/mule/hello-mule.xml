@@ -1,0 +1,382 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule
+	xmlns:salesforce="http://www.mulesoft.org/schema/mule/salesforce"
+	xmlns:ee="http://www.mulesoft.org/schema/mule/ee/core"
+	xmlns:db="http://www.mulesoft.org/schema/mule/db"
+	xmlns:http="http://www.mulesoft.org/schema/mule/http"
+	xmlns="http://www.mulesoft.org/schema/mule/core"
+	xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+	xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+	xsi:schemaLocation="http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+http://www.mulesoft.org/schema/mule/http http://www.mulesoft.org/schema/mule/http/current/mule-http.xsd
+http://www.mulesoft.org/schema/mule/db http://www.mulesoft.org/schema/mule/db/current/mule-db.xsd
+http://www.mulesoft.org/schema/mule/ee/core http://www.mulesoft.org/schema/mule/ee/core/current/mule-ee.xsd
+http://www.mulesoft.org/schema/mule/salesforce http://www.mulesoft.org/schema/mule/salesforce/current/mule-salesforce.xsd">
+
+	<configuration-properties
+		file="local.properties" />
+
+	<http:listener-config name="HTTP_Listener_config">
+		<http:listener-connection host="0.0.0.0"
+			port="8081" />
+	</http:listener-config>
+
+	<db:config name="Database_Config">
+		<db:generic-connection
+			url="jdbc:postgresql://${db.host}:${db.port}/${db.name}"
+			driverClassName="org.postgresql.Driver" user="${db.user}"
+			password="${db.password}" />
+	</db:config>
+
+	<salesforce:sfdc-config name="Salesforce_Config"
+		doc:name="Salesforce Config"
+		doc:id="2e0c4332-2d4f-448e-8ff9-25d09bf18c6a">
+		<salesforce:basic-connection
+			username="jovanovamariya.3f51cbaa256c@agentforce.com"
+			password='Jova2026nova!"£' securityToken="q7v8681IYXd2rOa1fdbXD0dHt"
+			url="https://login.salesforce.com/services/Soap/u/64.0" />
+	</salesforce:sfdc-config>
+	<sub-flow name="read-pending-rows-subflow">
+        <db:select config-ref="Database_Config" fetchSize="1000">
+            <db:sql><![CDATA[SELECT id, external_id, company_name, phone, city, industry
+FROM customers_staging
+WHERE sync_status = 'PENDING'
+ORDER BY id
+LIMIT :batchSize]]></db:sql>
+            <db:input-parameters>#[{ batchSize: vars.batchSize }]</db:input-parameters>
+        </db:select>
+    </sub-flow>
+	<!-- Atomically claims the next batch: PENDING -> IN_PROGRESS, and returns the rows -->
+<sub-flow name="claim-pending-rows-subflow">
+    <db:select config-ref="Database_Config">
+        <db:sql><![CDATA[SELECT id, external_id, company_name, phone, city, industry
+FROM claim_pending_rows(CAST(:batchSize AS INTEGER))]]></db:sql>
+        <db:input-parameters>#[{ batchSize: vars.batchSize }]</db:input-parameters>
+    </db:select>
+</sub-flow>
+
+<sub-flow name="rows-to-csv-subflow">
+    <ee:transform>
+        <ee:message>
+            <ee:set-payload><![CDATA[%dw 2.0
+output application/java
+---
+write(
+    payload map (row) -> do {
+        var n = trim(row.company_name default "")
+        ---
+        {
+            External_Customer_ID__c: trim(row.external_id),
+            Name: if (sizeOf(n) > 255) n[0 to 254] else n,
+            Phone: row.phone default "",
+            BillingCity: row.city default "",
+            Industry: row.industry default ""
+        }
+    },
+    "application/csv",
+    { separator: ",", lineSeparator: "\n", quoteValues: true }
+)]]></ee:set-payload>
+        </ee:message>
+    </ee:transform>
+</sub-flow>
+
+<sub-flow name="mark-synced-subflow">
+    <choice>
+        <when expression="#[!isEmpty(vars.syncedParams default [])]">
+            <db:bulk-update config-ref="Database_Config">
+                <db:bulk-input-parameters>#[vars.syncedParams]</db:bulk-input-parameters>
+                <db:sql><![CDATA[UPDATE customers_staging
+SET sync_status = 'SYNCED', sync_error = NULL, synced_at = now()
+WHERE external_id = :external_id AND sync_status = 'IN_PROGRESS']]></db:sql>
+            </db:bulk-update>
+        </when>
+    </choice>
+</sub-flow>
+
+<sub-flow name="mark-failed-subflow">
+    <choice>
+        <when expression="#[!isEmpty(vars.failedParams default [])]">
+            <db:bulk-update config-ref="Database_Config">
+                <db:bulk-input-parameters>#[vars.failedParams]</db:bulk-input-parameters>
+                <db:sql><![CDATA[UPDATE customers_staging
+SET sync_status = 'FAILED', sync_error = :error_message, synced_at = now()
+WHERE external_id = :external_id AND sync_status = 'IN_PROGRESS']]></db:sql>
+            </db:bulk-update>
+        </when>
+    </choice>
+</sub-flow>
+<!-- Reads the finished job's results and prepares the two lists of updates -->
+<sub-flow name="record-job-results-subflow">
+    <choice>
+        <when expression="#[vars.jobState == 'JobComplete']">
+            <salesforce:retrieve-job-failed-results-bulk-v2 config-ref="Salesforce_Config" id="#[vars.jobId]" />
+            <ee:transform>
+                <ee:message>
+                    <ee:set-payload><![CDATA[%dw 2.0
+output application/java
+---
+payload]]></ee:set-payload>
+                </ee:message>
+                <ee:variables>
+                    <ee:set-variable variableName="failedParams"><![CDATA[%dw 2.0
+output application/java
+---
+(if (payload is Array) payload else []) map ((f) -> {
+    external_id: f.originalFields.External_Customer_ID__c,
+    error_message: f.errorMessage
+})]]></ee:set-variable>
+                    <ee:set-variable variableName="syncedParams"><![CDATA[%dw 2.0
+output application/java
+var failedIds = (if (payload is Array) payload else []) map ((f) -> f.originalFields.External_Customer_ID__c)
+---
+(vars.claimedRows filter ((r) -> !(failedIds contains r.external_id))) map ((r) -> { external_id: r.external_id })]]></ee:set-variable>
+                </ee:variables>
+            </ee:transform>
+        </when>
+        <otherwise>
+            <!-- Job Failed or Aborted: nothing was loaded, so mark the whole batch as failed -->
+            <set-variable variableName="syncedParams" value="#[output application/java --- []]" />
+            <set-variable variableName="failedParams" value="#[output application/java --- vars.claimedRows map ((r) -> { external_id: r.external_id, error_message: (vars.jobInfo.errorMessage default ('Bulk job ended in state ' ++ vars.jobState)) })]" />
+        </otherwise>
+    </choice>
+    <flow-ref name="mark-failed-subflow" />
+    <flow-ref name="mark-synced-subflow" />
+</sub-flow>
+
+    <flow name="hello-mule-flow">
+        <http:listener config-ref="HTTP_Listener_config" path="/hello" />
+        <set-payload value="Hello Marija" />
+    </flow>
+
+    <flow name="sync-customers-flow">
+        <http:listener config-ref="HTTP_Listener_config" path="/sync" />
+        <set-variable variableName="batchSize" value="#[(attributes.queryParams.limit default '1000') as Number]" />
+        <flow-ref name="read-pending-rows-subflow" />
+        <logger level="INFO" message="#['Fetched ' ++ sizeOf(payload) ++ ' rows']" />
+        <set-payload value="#[output application/json --- { fetched: sizeOf(payload) }]" />
+    </flow>
+
+    <flow name="sf-login-test-flow" doc:id="94a02ec5-3c5a-4560-82db-9ee5f8e045f1" >
+		<http:listener doc:name="Listener" doc:id="8c11e6ed-4394-4fb1-9a8e-f27e82e78675" config-ref="HTTP_Listener_config" path="/sf-test"/>
+		<salesforce:query doc:name="Query" doc:id="e3bf3cf4-2353-42fc-b13e-e1ecbce4ace8" config-ref="Salesforce_Config">
+			<salesforce:salesforce-query ><![CDATA[SELECT Id, Name FROM Account LIMIT 5]]></salesforce:salesforce-query>
+		</salesforce:query>
+		<ee:transform doc:name="Transform Message" doc:id="0cd6a93a-cbf3-4a1f-9b3d-cea609ba4b76">
+			<ee:message>
+				<ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+payload]]></ee:set-payload>
+			</ee:message>
+		</ee:transform>
+	</flow>
+	<flow name="preview-mapping-flow">
+        <http:listener config-ref="HTTP_Listener_config" path="/preview" />
+        <set-variable variableName="batchSize" value="#[(attributes.queryParams.limit default '5') as Number]" />
+        <flow-ref name="read-pending-rows-subflow" />
+        <ee:transform>
+            <ee:message>
+                <ee:set-payload><![CDATA[%dw 2.0
+output application/csv quoteValues=true
+---
+payload map (row) -> {
+    External_Customer_ID__c: trim(row.external_id),
+    Name: trim(row.company_name),
+    Phone: row.phone default "",
+    BillingCity: row.city default "",
+    Industry: row.industry default ""
+}]]></ee:set-payload>
+            </ee:message>
+        </ee:transform>
+    </flow>
+<flow name="sync-bulk-flow">
+    <http:listener config-ref="HTTP_Listener_config" path="/sync-bulk" />
+    <set-variable variableName="batchSize" value="#[(attributes.queryParams.limit default '100') as Number]" />
+    <set-variable variableName="t0" value="#[now() as Number {unit: 'milliseconds'}]" />
+    <flow-ref name="claim-pending-rows-subflow" />
+    <set-variable variableName="claimedRows" value="#[output application/java --- payload]" />
+    <set-variable variableName="rowCount" value="#[sizeOf(vars.claimedRows)]" />
+    <choice>
+        <when expression="#[vars.rowCount == 0]">
+            <set-payload value="#[output application/json --- { message: 'Nothing pending to sync', claimed: 0 }]" />
+        </when>
+        <otherwise>
+            <logger level="INFO" message="#['Claimed ' ++ vars.rowCount ++ ' rows']" />
+            <set-payload value="#[output application/java --- vars.claimedRows]" />
+			<flow-ref name="rows-to-csv-subflow" />
+            <salesforce:create-job-bulk-api-v2 config-ref="Salesforce_Config" objectType="Account" operation="upsert" externalIdFieldName="External_Customer_ID__c">
+                <salesforce:s-objects><![CDATA[#[payload as Binary]]]></salesforce:s-objects>
+            </salesforce:create-job-bulk-api-v2>
+            <set-variable variableName="jobId" value="#[payload.id]" />
+            <set-variable variableName="t1" value="#[now() as Number {unit: 'milliseconds'}]" />
+            <logger level="INFO" message="#['Created Bulk job ' ++ vars.jobId]" />
+            <until-successful maxRetries="60" millisBetweenRetries="2000">
+                <salesforce:get-job-state-bulk-api-v2 config-ref="Salesforce_Config" id="#[vars.jobId]" />
+                <set-variable variableName="jobInfo" value="#[payload]" />
+                <set-variable variableName="jobState" value="#[payload.state]" />
+                <choice>
+                    <when expression="#[['JobComplete','Failed','Aborted'] contains vars.jobState]">
+                        <logger level="INFO" message="#['Job ' ++ vars.jobId ++ ' finished: ' ++ vars.jobState]" />
+                    </when>
+                    <otherwise>
+                        <raise-error type="APP:JOB_IN_PROGRESS" description="Bulk job is still running" />
+                    </otherwise>
+                </choice>
+            </until-successful>
+            <set-variable variableName="t2" value="#[now() as Number {unit: 'milliseconds'}]" />
+            <flow-ref name="record-job-results-subflow" />
+            <set-payload value="#[output application/json --- {
+                jobId: vars.jobId,
+                state: vars.jobState,
+                claimed: vars.rowCount,
+                synced: sizeOf(vars.syncedParams default []),
+                failed: sizeOf(vars.failedParams default []),
+                timingsMs: {
+                    claimTransformUpload: vars.t1 - vars.t0,
+                    salesforceProcessing: vars.t2 - vars.t1,
+                    resultsAndDbUpdate: (now() as Number {unit: 'milliseconds'}) - vars.t2,
+                    total: (now() as Number {unit: 'milliseconds'}) - vars.t0
+                }
+            }]" />
+        </otherwise>
+    </choice>
+    <error-handler>
+        <on-error-continue logException="true">
+            <logger level="ERROR" message="#['Sync failed: ' ++ (error.description default 'unknown')]" />
+            <choice>
+                <when expression="#[!isEmpty(vars.claimedRows default [])]">
+                    <set-variable variableName="failedParams" value="#[output application/java --- (vars.claimedRows default []) map ((r) -> { external_id: r.external_id, error_message: 'Sync error: ' ++ (error.description default 'unknown') })]" />
+                    <flow-ref name="mark-failed-subflow" />
+                </when>
+            </choice>
+            <set-payload value="#[output application/json --- { status: 'ERROR', error: error.description default 'unknown' }]" />
+        </on-error-continue>
+    </error-handler>
+</flow>
+<flow name="job-failed-results-flow">
+    <http:listener config-ref="HTTP_Listener_config" path="/job-failed" />
+    <set-variable variableName="jobId" value="#[attributes.queryParams.id]" />
+    <salesforce:retrieve-job-failed-results-bulk-v2 config-ref="Salesforce_Config" id="#[vars.jobId]" />
+    <ee:transform>
+        <ee:message>
+            <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+---
+payload]]></ee:set-payload>
+        </ee:message>
+    </ee:transform>
+</flow>
+<flow name="upsert-account-flow">
+    <http:listener config-ref="HTTP_Listener_config" path="/accounts" allowedMethods="POST">
+        <http:response statusCode="#[vars.httpStatus default 200]" />
+        <http:error-response statusCode="#[vars.httpStatus default 500]">
+            <http:body>#[payload]</http:body>
+        </http:error-response>
+    </http:listener>
+    <set-variable variableName="httpStatus" value="#[200]" />
+    <choice>
+        <when expression="#[isEmpty(payload.externalId default '') or isEmpty(payload.name default '')]">
+            <set-variable variableName="httpStatus" value="#[400]" />
+            <set-payload value="#[output application/json --- { error: 'externalId and name are required' }]" />
+        </when>
+        <otherwise>
+            <!-- 1) Build the list of records the connector expects -->
+            <ee:transform>
+                <ee:message>
+                    <ee:set-payload><![CDATA[%dw 2.0
+output application/java
+---
+[{
+    External_Customer_ID__c: trim(payload.externalId),
+    Name: trim(payload.name),
+    Phone: payload.phone default "",
+    BillingCity: payload.city default "",
+    Industry: payload.industry default ""
+}]]]></ee:set-payload>
+                </ee:message>
+            </ee:transform>
+            <!-- 2) Upsert -->
+            <salesforce:upsert config-ref="Salesforce_Config" objectType="Account" externalIdFieldName="External_Customer_ID__c" />
+            <!-- 3) Shape the response and the HTTP status -->
+            <ee:transform>
+                <ee:message>
+                    <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+var r = payload.items[0]
+---
+{
+    successful: payload.successful,
+    accountId: r.id,
+    errors: if (r.successful default false) [] else [r.message default "Unknown error"]
+}]]></ee:set-payload>
+                </ee:message>
+                <ee:variables>
+                    <ee:set-variable variableName="httpStatus"><![CDATA[%dw 2.0
+output application/java
+---
+if (payload.successful default false) 200 else 422]]></ee:set-variable>
+                </ee:variables>
+            </ee:transform>
+        </otherwise>
+    </choice>
+    <error-handler>
+        <on-error-continue logException="true">
+            <set-variable variableName="httpStatus" value="#[502]" />
+            <set-payload value="#[output application/json --- {
+                error: error.description default 'unknown',
+                errorType: (error.errorType.namespace default '') ++ ':' ++ (error.errorType.identifier default '')
+            }]" />
+        </on-error-continue>
+    </error-handler>
+</flow>
+<flow name="bench-mapping-flow">
+    <http:listener config-ref="HTTP_Listener_config" path="/bench" />
+    <set-variable variableName="batchSize" value="#[(attributes.queryParams.limit default '10000') as Number]" />
+    <set-variable variableName="t0" value="#[now() as Number {unit: 'milliseconds'}]" />
+    <flow-ref name="read-pending-rows-subflow" />
+    <set-variable variableName="rowCount" value="#[sizeOf(payload)]" />
+    <set-variable variableName="t1" value="#[now() as Number {unit: 'milliseconds'}]" />
+    <ee:transform>
+        <ee:message>
+            <ee:set-payload><![CDATA[%dw 2.0
+output application/java
+---
+write(
+    payload map (row) -> do {
+        var n = trim(row.company_name default "")
+        ---
+        {
+            External_Customer_ID__c: trim(row.external_id),
+            Name: if (sizeOf(n) > 255) n[0 to 254] else n,
+            Phone: row.phone default "",
+            BillingCity: row.city default "",
+            Industry: row.industry default ""
+        }
+    },
+    "application/csv",
+    { separator: ",", lineSeparator: "\n", quoteValues: true }
+)]]></ee:set-payload>
+        </ee:message>
+    </ee:transform>
+    <set-variable variableName="t2" value="#[now() as Number {unit: 'milliseconds'}]" />
+    <ee:transform>
+        <ee:message>
+            <ee:set-payload><![CDATA[%dw 2.0
+output application/json
+var readMs = vars.t1 - vars.t0
+var mapMs = vars.t2 - vars.t1
+var totalMs = vars.t2 - vars.t0
+var safeSeconds = (if (totalMs > 0) totalMs else 1) / 1000
+---
+{
+    rows: vars.rowCount,
+    readFromPostgresMs: readMs,
+    mapToCsvMs: mapMs,
+    totalMs: totalMs,
+    csvKilobytes: round(sizeOf(payload) / 1024),
+    rowsPerSecond: round(vars.rowCount / safeSeconds)
+}]]></ee:set-payload>
+        </ee:message>
+    </ee:transform>
+</flow>
+</mule>

@@ -1,0 +1,175 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mule xmlns="http://www.mulesoft.org/schema/mule/core"
+    xmlns:munit="http://www.mulesoft.org/schema/mule/munit"
+    xmlns:munit-tools="http://www.mulesoft.org/schema/mule/munit-tools"
+    xmlns:doc="http://www.mulesoft.org/schema/mule/documentation"
+    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+    xsi:schemaLocation="
+http://www.mulesoft.org/schema/mule/core http://www.mulesoft.org/schema/mule/core/current/mule.xsd
+http://www.mulesoft.org/schema/mule/munit http://www.mulesoft.org/schema/mule/munit/current/mule-munit.xsd
+http://www.mulesoft.org/schema/mule/munit-tools http://www.mulesoft.org/schema/mule/munit-tools/current/mule-munit-tools.xsd">
+
+    <munit:config name="mapping-and-results-test-suite.xml" />
+
+    <!-- ============ DataWeave mapping tests ============ -->
+
+    <munit:test name="mapping-produces-salesforce-csv-and-trims-values"
+        description="Rows become CSV with Salesforce API field names; padded values are trimmed">
+        <munit:behavior>
+            <munit:set-event>
+                <munit:payload mediaType="application/java"
+                    value="#[[{ id: 1, external_id: ' CUST-000001 ', company_name: '  Company 1  ', phone: '+38970000000', city: 'Skopje', industry: 'Banking' }]]" />
+            </munit:set-event>
+        </munit:behavior>
+        <munit:execution>
+            <flow-ref name="rows-to-csv-subflow" />
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:assert-that expression="#[payload contains 'External_Customer_ID__c,Name,Phone,BillingCity,Industry']"
+                is="#[MunitTools::equalTo(true)]" message="Header row must use Salesforce API field names" />
+            <munit-tools:assert-that expression="#[payload contains '&quot;Company 1&quot;']"
+                is="#[MunitTools::equalTo(true)]" message="Name must be present and trimmed" />
+            <munit-tools:assert-that expression="#[payload contains '&quot;CUST-000001&quot;']"
+                is="#[MunitTools::equalTo(true)]" message="External ID must be present and trimmed" />
+        </munit:validation>
+    </munit:test>
+
+    <munit:test name="mapping-truncates-names-over-255-characters"
+        description="A 300-character name is cut to 255; shorter names are untouched (regression for the empty-Name bug)">
+        <munit:behavior>
+            <munit:set-event>
+                <munit:payload mediaType="application/java"
+                    value="#[[{ id: 2, external_id: 'CUST-000002', company_name: ((1 to 300) map 'A' joinBy ''), phone: '+38970000001', city: 'Ohrid', industry: 'Retail' }]]" />
+            </munit:set-event>
+        </munit:behavior>
+        <munit:execution>
+            <flow-ref name="rows-to-csv-subflow" />
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:assert-that
+                expression="#[payload contains ('&quot;' ++ ((1 to 255) map 'A' joinBy '') ++ '&quot;')]"
+                is="#[MunitTools::equalTo(true)]" message="Name must be exactly 255 characters" />
+        </munit:validation>
+    </munit:test>
+
+    <munit:test name="mapping-never-writes-the-word-null"
+        description="Missing optional fields become empty values, not the text null">
+        <munit:behavior>
+            <munit:set-event>
+                <munit:payload mediaType="application/java"
+                    value="#[[{ id: 3, external_id: 'CUST-000003', company_name: 'Company 3', phone: null, city: null, industry: null }]]" />
+            </munit:set-event>
+        </munit:behavior>
+        <munit:execution>
+            <flow-ref name="rows-to-csv-subflow" />
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:assert-that expression="#[payload contains 'null']"
+                is="#[MunitTools::equalTo(false)]" message="The text null must not appear in the CSV" />
+            <munit-tools:assert-that expression="#[payload contains '&quot;Company 3&quot;']"
+                is="#[MunitTools::equalTo(true)]" message="Name must still be present" />
+        </munit:validation>
+    </munit:test>
+
+    <!-- ============ Job result handling tests (Salesforce and database are mocked) ============ -->
+
+    <munit:test name="results-one-failed-row-is-marked-failed-and-others-synced"
+        description="One failed row from Salesforce -> FAILED with its error; the rest -> SYNCED">
+        <munit:behavior>
+            <munit-tools:mock-when processor="salesforce:retrieve-job-failed-results-bulk-v2">
+                <munit-tools:then-return>
+                    <munit-tools:payload mediaType="application/java"
+                        value="#[[{ originalFields: { External_Customer_ID__c: 'CUST-000002' }, errorMessage: 'REQUIRED_FIELD_MISSING:Required fields are missing: [Name]:Name --', id: '' }]]" />
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="db:bulk-update">
+                <munit-tools:then-return>
+                    <munit-tools:payload mediaType="application/java" value="#[[1]]" />
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit:set-event>
+                <munit:variables>
+                    <munit:variable key="jobState" value="JobComplete" />
+                    <munit:variable key="jobId" value="750TESTJOB" />
+                    <munit:variable key="claimedRows" mediaType="application/java"
+                        value="#[[{ external_id: 'CUST-000001' }, { external_id: 'CUST-000002' }, { external_id: 'CUST-000003' }]]" />
+                </munit:variables>
+            </munit:set-event>
+        </munit:behavior>
+        <munit:execution>
+            <flow-ref name="record-job-results-subflow" />
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:assert-that expression="#[sizeOf(vars.failedParams)]" is="#[MunitTools::equalTo(1)]" />
+            <munit-tools:assert-that expression="#[vars.failedParams[0].external_id]" is="#[MunitTools::equalTo('CUST-000002')]" />
+            <munit-tools:assert-that expression="#[vars.failedParams[0].error_message contains 'REQUIRED_FIELD_MISSING']"
+                is="#[MunitTools::equalTo(true)]" message="Salesforce error text must be kept" />
+            <munit-tools:assert-that expression="#[sizeOf(vars.syncedParams)]" is="#[MunitTools::equalTo(2)]" />
+            <munit-tools:assert-that expression="#[(vars.syncedParams map $.external_id) contains 'CUST-000002']"
+                is="#[MunitTools::equalTo(false)]" message="The failed row must not also be marked synced" />
+            <munit-tools:verify-call processor="db:bulk-update" times="2" />
+        </munit:validation>
+    </munit:test>
+
+    <munit:test name="results-no-failures-marks-everything-synced"
+        description="No failed rows -> all rows SYNCED, only one database update is made">
+        <munit:behavior>
+            <munit-tools:mock-when processor="salesforce:retrieve-job-failed-results-bulk-v2">
+                <munit-tools:then-return>
+                    <munit-tools:payload mediaType="application/java" value="#[[]]" />
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit-tools:mock-when processor="db:bulk-update">
+                <munit-tools:then-return>
+                    <munit-tools:payload mediaType="application/java" value="#[[1]]" />
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit:set-event>
+                <munit:variables>
+                    <munit:variable key="jobState" value="JobComplete" />
+                    <munit:variable key="jobId" value="750TESTJOB" />
+                    <munit:variable key="claimedRows" mediaType="application/java"
+                        value="#[[{ external_id: 'CUST-000001' }, { external_id: 'CUST-000002' }, { external_id: 'CUST-000003' }]]" />
+                </munit:variables>
+            </munit:set-event>
+        </munit:behavior>
+        <munit:execution>
+            <flow-ref name="record-job-results-subflow" />
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:assert-that expression="#[sizeOf(vars.failedParams default [])]" is="#[MunitTools::equalTo(0)]" />
+            <munit-tools:assert-that expression="#[sizeOf(vars.syncedParams)]" is="#[MunitTools::equalTo(3)]" />
+            <munit-tools:verify-call processor="db:bulk-update" times="1" />
+        </munit:validation>
+    </munit:test>
+
+    <munit:test name="results-failed-job-marks-whole-batch-failed"
+        description="If the Bulk job itself fails, every claimed row is marked FAILED with the job error">
+        <munit:behavior>
+            <munit-tools:mock-when processor="db:bulk-update">
+                <munit-tools:then-return>
+                    <munit-tools:payload mediaType="application/java" value="#[[1]]" />
+                </munit-tools:then-return>
+            </munit-tools:mock-when>
+            <munit:set-event>
+                <munit:variables>
+                    <munit:variable key="jobState" value="Failed" />
+                    <munit:variable key="jobId" value="750TESTJOB" />
+                    <munit:variable key="jobInfo" mediaType="application/java" value="#[{ errorMessage: 'Quota exceeded' }]" />
+                    <munit:variable key="claimedRows" mediaType="application/java"
+                        value="#[[{ external_id: 'CUST-000001' }, { external_id: 'CUST-000002' }, { external_id: 'CUST-000003' }]]" />
+                </munit:variables>
+            </munit:set-event>
+        </munit:behavior>
+        <munit:execution>
+            <flow-ref name="record-job-results-subflow" />
+        </munit:execution>
+        <munit:validation>
+            <munit-tools:assert-that expression="#[sizeOf(vars.failedParams)]" is="#[MunitTools::equalTo(3)]" />
+            <munit-tools:assert-that expression="#[vars.failedParams[0].error_message]" is="#[MunitTools::equalTo('Quota exceeded')]" />
+            <munit-tools:assert-that expression="#[sizeOf(vars.syncedParams)]" is="#[MunitTools::equalTo(0)]" />
+            <munit-tools:verify-call processor="db:bulk-update" times="1" />
+        </munit:validation>
+    </munit:test>
+
+</mule>
